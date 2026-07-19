@@ -5,13 +5,24 @@
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",
-    "dev": "bun --watch src/index.ts"
+    "dev": "bun --watch src/index.ts",
+    "db:init": "supabase init",
+    "db:link": "supabase link",
+    "db:migrate": "supabase db push --linked",
+    "db:migrate:local": "supabase migration up --local",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@octokit/auth-app": "^8.2.0",
+    "@octokit/rest": "^22.0.1",
+    "@openrouter/sdk": "^0.13.65",
+    "@supabase/supabase-js": "^2.110.7",
     "spectrum-ts": "^8.0.0"
   },
   "devDependencies": {
-    "typescript": "^5",
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "supabase": "^2.109.1",
+    "typescript": "^5"
   }
 }

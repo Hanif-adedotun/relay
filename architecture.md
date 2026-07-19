@@ -256,7 +256,7 @@ Relay ships with:
 
 Default:
 
-* Groq
+* Open Router Groq
 
 Bring Your Own Model:
 
