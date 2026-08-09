@@ -117,6 +117,13 @@ PROJECT_ID=...
 PROJECT_SECRET=...
 ```
 
+For GitHub App write flows (create branch, commit files, open PRs), the installed app needs:
+
+- **Contents: Read and write**
+- **Pull requests: Read and write**
+
+Accept the permission update on the installation after changing these in the App settings.
+
 Run:
 
 ```sh

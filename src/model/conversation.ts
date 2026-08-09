@@ -9,7 +9,17 @@ export type ConversationAction =
   | "list_branches"
   | "select_branch"
   | "inspect_repository"
+  | "create_branch"
+  | "commit_files"
+  | "create_pull_request"
   | "offer_github_connect";
+
+export type CommitMode = "upsert" | "replace";
+
+export interface ConversationFileChange {
+  path: string;
+  content: string | null;
+}
 
 export interface ConversationContext {
   firstContact: boolean;
@@ -22,6 +32,7 @@ export interface ConversationContext {
   canSelectRepository: boolean;
   canListBranches: boolean;
   canInspectRepository: boolean;
+  canWriteRepository: boolean;
 }
 
 export interface ConversationTurnInput {
@@ -38,6 +49,11 @@ export interface ConversationTurnOutput {
   action: ConversationAction;
   repository: string | null;
   branch: string | null;
+  commitMessage: string | null;
+  commitMode: CommitMode | null;
+  files: ConversationFileChange[] | null;
+  prTitle: string | null;
+  prBody: string | null;
 }
 
 export interface ConversationModel {
@@ -58,13 +74,21 @@ Actions:
 - list_branches: list branches for the active repository
 - select_branch: set the active branch (provide branch)
 - inspect_repository: fetch README, top-level files, manifests, and recent commits for the active repo (optional branch ref)
+- create_branch: create a branch from the active/default branch (provide branch)
+- commit_files: commit file creates/updates/deletes on a branch (provide branch, commitMessage, commitMode, files)
+- create_pull_request: open a PR from branch into the default branch (provide branch as head, prTitle, optional prBody)
 - offer_github_connect: user should connect GitHub; application will append a trusted link
+commitMode:
+- upsert: create/update listed files; set content null to delete a path
+- replace: new commit tree contains ONLY the provided files (destructive; requires clear user intent to wipe/replace the repo)
+Never invent file contents; use text the user provided (or empty string only if they asked for an empty file).
 If GitHub is not connected and the user needs repo access, use offer_github_connect.
 If they ask general questions, answer without forcing GitHub.
 When pendingGithubConfirmation is true, acknowledge connection briefly and ask which repository to use.
-If the user needs branches or a codebase summary and there is no activeRepo, select_repository first (or list_repositories if unclear).
+If the user needs branches, writes, or a codebase summary and there is no activeRepo, select_repository first (or list_repositories if unclear).
 When they ask what a repo/codebase does, or about structure/stack/README, use inspect_repository then answer only from tool results.
 When they ask about branches, use list_branches; when they pick one, use select_branch.
+For create branch → commit → open PR workflows, run actions in sequence across tool turns.
 Respond with JSON only matching the schema.`;
 
 function sanitizeReply(reply: string): string {
@@ -82,6 +106,9 @@ function parseAction(value: unknown): ConversationAction {
     value === "list_branches" ||
     value === "select_branch" ||
     value === "inspect_repository" ||
+    value === "create_branch" ||
+    value === "commit_files" ||
+    value === "create_pull_request" ||
     value === "offer_github_connect" ||
     value === "none"
   ) {
@@ -90,12 +117,60 @@ function parseAction(value: unknown): ConversationAction {
   return "none";
 }
 
+function parseCommitMode(value: unknown): CommitMode | null {
+  if (value === "upsert" || value === "replace") return value;
+  return null;
+}
+
+function parseFiles(value: unknown): ConversationFileChange[] | null {
+  if (!Array.isArray(value)) return null;
+  const files: ConversationFileChange[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const path =
+      "path" in entry && typeof entry.path === "string" ? entry.path.trim() : "";
+    if (!path) continue;
+    const content =
+      "content" in entry
+        ? entry.content === null
+          ? null
+          : typeof entry.content === "string"
+            ? entry.content
+            : null
+        : null;
+    if (!("content" in entry)) continue;
+    if (entry.content !== null && typeof entry.content !== "string") continue;
+    files.push({ path, content });
+  }
+  return files.length > 0 ? files : null;
+}
+
+export function emptyTurnFields(): Pick<
+  ConversationTurnOutput,
+  | "repository"
+  | "branch"
+  | "commitMessage"
+  | "commitMode"
+  | "files"
+  | "prTitle"
+  | "prBody"
+> {
+  return {
+    repository: null,
+    branch: null,
+    commitMessage: null,
+    commitMode: null,
+    files: null,
+    prTitle: null,
+    prBody: null,
+  };
+}
+
 export function fallbackConversationTurn(): ConversationTurnOutput {
   return {
     reply: FALLBACK_REPLY,
     action: "none",
-    repository: null,
-    branch: null,
+    ...emptyTurnFields(),
   };
 }
 
@@ -119,7 +194,7 @@ export class OpenRouterConversationModel implements ConversationModel {
             model: config.model,
             stream: false,
             temperature: 0.2,
-            maxTokens: 800,
+            maxTokens: 2000,
             responseFormat: {
               type: "json_schema",
               jsonSchema: {
@@ -139,13 +214,45 @@ export class OpenRouterConversationModel implements ConversationModel {
                         "list_branches",
                         "select_branch",
                         "inspect_repository",
+                        "create_branch",
+                        "commit_files",
+                        "create_pull_request",
                         "offer_github_connect",
                       ],
                     },
                     repository: { type: ["string", "null"] },
                     branch: { type: ["string", "null"] },
+                    commitMessage: { type: ["string", "null"] },
+                    commitMode: {
+                      type: ["string", "null"],
+                      enum: ["upsert", "replace", null],
+                    },
+                    files: {
+                      type: ["array", "null"],
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        properties: {
+                          path: { type: "string" },
+                          content: { type: ["string", "null"] },
+                        },
+                        required: ["path", "content"],
+                      },
+                    },
+                    prTitle: { type: ["string", "null"] },
+                    prBody: { type: ["string", "null"] },
                   },
-                  required: ["reply", "action", "repository", "branch"],
+                  required: [
+                    "reply",
+                    "action",
+                    "repository",
+                    "branch",
+                    "commitMessage",
+                    "commitMode",
+                    "files",
+                    "prTitle",
+                    "prBody",
+                  ],
                 },
               },
             },
@@ -172,6 +279,11 @@ export class OpenRouterConversationModel implements ConversationModel {
           action?: unknown;
           repository?: unknown;
           branch?: unknown;
+          commitMessage?: unknown;
+          commitMode?: unknown;
+          files?: unknown;
+          prTitle?: unknown;
+          prBody?: unknown;
         };
 
         if (typeof parsed.reply !== "string") return null;
@@ -182,6 +294,14 @@ export class OpenRouterConversationModel implements ConversationModel {
           repository:
             typeof parsed.repository === "string" ? parsed.repository : null,
           branch: typeof parsed.branch === "string" ? parsed.branch : null,
+          commitMessage:
+            typeof parsed.commitMessage === "string"
+              ? parsed.commitMessage
+              : null,
+          commitMode: parseCommitMode(parsed.commitMode),
+          files: parseFiles(parsed.files),
+          prTitle: typeof parsed.prTitle === "string" ? parsed.prTitle : null,
+          prBody: typeof parsed.prBody === "string" ? parsed.prBody : null,
         };
       });
   }
@@ -194,35 +314,47 @@ export class OpenRouterConversationModel implements ConversationModel {
       const reply = sanitizeReply(output.reply);
       if (!reply) return fallbackConversationTurn();
 
+      const base = {
+        reply,
+        repository: output.repository?.trim() || null,
+        branch: output.branch?.trim() || null,
+        commitMessage: output.commitMessage?.trim() || null,
+        commitMode: output.commitMode,
+        files: output.files,
+        prTitle: output.prTitle?.trim() || null,
+        prBody: output.prBody?.trim() || null,
+      };
+
       if (
         output.action === "select_repository" &&
-        (!output.repository || !output.repository.trim())
+        (!base.repository || !base.repository.trim())
       ) {
-        return {
-          reply,
-          action: "none",
-          repository: null,
-          branch: null,
-        };
+        return { ...base, action: "none", ...emptyTurnFields(), reply };
       }
 
       if (
-        output.action === "select_branch" &&
-        (!output.branch || !output.branch.trim())
+        (output.action === "select_branch" ||
+          output.action === "create_branch") &&
+        !base.branch
       ) {
-        return {
-          reply,
-          action: "none",
-          repository: null,
-          branch: null,
-        };
+        return { ...base, action: "none", ...emptyTurnFields(), reply };
+      }
+
+      if (output.action === "commit_files") {
+        if (!base.branch || !base.commitMessage || !base.commitMode || !base.files) {
+          return { ...base, action: "none", ...emptyTurnFields(), reply };
+        }
+      }
+
+      if (output.action === "create_pull_request") {
+        if (!base.branch || !base.prTitle) {
+          return { ...base, action: "none", ...emptyTurnFields(), reply };
+        }
       }
 
       return {
-        reply,
+        ...base,
         action: output.action,
-        repository: output.repository?.trim() || null,
-        branch: output.branch?.trim() || null,
       };
     } catch (error) {
       console.error(

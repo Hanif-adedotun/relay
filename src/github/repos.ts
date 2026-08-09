@@ -8,6 +8,8 @@ const MAX_TOP_LEVEL_ENTRIES = 40;
 const MAX_README_CHARS = 4000;
 const MAX_MANIFEST_CHARS = 2000;
 const MAX_RECENT_COMMITS = 5;
+const MAX_COMMIT_FILES = 20;
+const MAX_FILE_BYTES = 200 * 1024;
 
 const MANIFEST_PATHS = [
   "package.json",
@@ -56,6 +58,44 @@ export interface GitHubRepositoryInspection {
   recentCommits: GitHubCommitSummary[];
 }
 
+export interface GitHubFileChange {
+  path: string;
+  /** File text content, or null to delete (upsert mode only). */
+  content: string | null;
+}
+
+export type GitHubCommitMode = "upsert" | "replace";
+
+export interface GitHubCommitFilesInput {
+  branch: string;
+  message: string;
+  mode: GitHubCommitMode;
+  files: GitHubFileChange[];
+}
+
+export interface GitHubCommitResult {
+  branch: string;
+  sha: string;
+  message: string;
+  mode: GitHubCommitMode;
+  changedPaths: string[];
+}
+
+export interface GitHubPullRequestInput {
+  head: string;
+  title: string;
+  body?: string | null;
+  base?: string | null;
+}
+
+export interface GitHubPullRequestResult {
+  number: number;
+  url: string;
+  title: string;
+  head: string;
+  base: string;
+}
+
 export interface GitHubReposClient {
   listRepositories(installationId: number): Promise<GitHubRepositorySummary[]>;
   findRepository(
@@ -71,6 +111,22 @@ export interface GitHubReposClient {
     fullName: string,
     ref?: string,
   ): Promise<GitHubRepositoryInspection>;
+  createBranch(
+    installationId: number,
+    fullName: string,
+    branch: string,
+    fromRef?: string,
+  ): Promise<{ branch: string; sha: string; fromRef: string }>;
+  commitFiles(
+    installationId: number,
+    fullName: string,
+    input: GitHubCommitFilesInput,
+  ): Promise<GitHubCommitResult>;
+  createPullRequest(
+    installationId: number,
+    fullName: string,
+    input: GitHubPullRequestInput,
+  ): Promise<GitHubPullRequestResult>;
 }
 
 export function parseRepositoryFullName(fullName: string): {
@@ -82,6 +138,38 @@ export function parseRepositoryFullName(fullName: string): {
     throw new Error(`Invalid repository full name "${fullName}"`);
   }
   return { owner, repo };
+}
+
+export function validateRepoPath(path: string): string {
+  const trimmed = path.trim().replaceAll("\\", "/");
+  if (!trimmed) {
+    throw new Error("File path cannot be empty");
+  }
+  if (trimmed.startsWith("/") || trimmed.startsWith("./")) {
+    throw new Error(`Invalid file path "${path}"`);
+  }
+  const parts = trimmed.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error(`Invalid file path "${path}"`);
+  }
+  return trimmed;
+}
+
+export function validateBranchName(branch: string): string {
+  const trimmed = branch.trim();
+  if (!trimmed) {
+    throw new Error("Branch name cannot be empty");
+  }
+  if (
+    trimmed.startsWith("/") ||
+    trimmed.endsWith("/") ||
+    trimmed.includes("..") ||
+    trimmed.includes(" ") ||
+    trimmed.includes("\\")
+  ) {
+    throw new Error(`Invalid branch name "${branch}"`);
+  }
+  return trimmed;
 }
 
 function truncateText(value: string, maxChars: number): string {
@@ -189,6 +277,67 @@ async function fetchOptionalFileText(
     }
     throw error;
   }
+}
+
+async function resolveRefSha(
+  github: Octokit,
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<string> {
+  const response = await github.rest.git.getRef({
+    owner,
+    repo,
+    ref: `heads/${ref}`,
+  });
+  return response.data.object.sha;
+}
+
+function normalizeCommitFiles(
+  files: GitHubFileChange[],
+  mode: GitHubCommitMode,
+): GitHubFileChange[] {
+  if (files.length === 0) {
+    throw new Error("At least one file change is required");
+  }
+  if (files.length > MAX_COMMIT_FILES) {
+    throw new Error(`At most ${MAX_COMMIT_FILES} files can be changed per commit`);
+  }
+
+  const normalized: GitHubFileChange[] = [];
+  const seen = new Set<string>();
+  for (const file of files) {
+    const path = validateRepoPath(file.path);
+    if (seen.has(path)) {
+      throw new Error(`Duplicate file path "${path}"`);
+    }
+    seen.add(path);
+
+    if (file.content === null) {
+      if (mode === "replace") {
+        throw new Error("replace mode cannot include file deletions");
+      }
+      normalized.push({ path, content: null });
+      continue;
+    }
+
+    if (typeof file.content !== "string") {
+      throw new Error(`Invalid content for "${path}"`);
+    }
+    const bytes = Buffer.byteLength(file.content, "utf8");
+    if (bytes > MAX_FILE_BYTES) {
+      throw new Error(
+        `File "${path}" exceeds ${MAX_FILE_BYTES} byte limit (${bytes} bytes)`,
+      );
+    }
+    normalized.push({ path, content: file.content });
+  }
+
+  if (mode === "replace" && normalized.every((file) => file.content === null)) {
+    throw new Error("replace mode requires at least one file with content");
+  }
+
+  return normalized;
 }
 
 export function createInstallationReposClient(
@@ -432,6 +581,201 @@ export function createInstallationReposClient(
         throw new Error(`Failed to inspect ${fullName}: ${detail}`, {
           cause: error,
         });
+      }
+    },
+
+    async createBranch(installationId, fullName, branch, fromRef) {
+      const { owner, repo } = parseRepositoryFullName(fullName);
+      const branchName = validateBranchName(branch);
+      console.info(
+        `[github] creating branch ${branchName} on ${fullName}` +
+          (fromRef ? ` from ${fromRef}` : "") +
+          ` (installation ${installationId})`,
+      );
+      const github = createInstallationOctokit(config, installationId);
+
+      try {
+        const repoResponse = await github.rest.repos.get({ owner, repo });
+        const baseRef = validateBranchName(
+          fromRef?.trim() || repoResponse.data.default_branch,
+        );
+        const sha = await resolveRefSha(github, owner, repo, baseRef);
+
+        await github.rest.git.createRef({
+          owner,
+          repo,
+          ref: `refs/heads/${branchName}`,
+          sha,
+        });
+
+        console.info(
+          `[github] created branch ${branchName} on ${fullName} from ${baseRef} at ${sha.slice(0, 7)}`,
+        );
+        return { branch: branchName, sha, fromRef: baseRef };
+      } catch (error) {
+        const detail = formatGitHubError(error);
+        console.error(
+          `[github] failed to create branch ${branchName} on ${fullName}: ${detail}`,
+        );
+        throw new Error(
+          `Failed to create branch ${branchName} on ${fullName}: ${detail}`,
+          { cause: error },
+        );
+      }
+    },
+
+    async commitFiles(installationId, fullName, input) {
+      const { owner, repo } = parseRepositoryFullName(fullName);
+      const branchName = validateBranchName(input.branch);
+      const message = input.message.trim();
+      if (!message) {
+        throw new Error("Commit message cannot be empty");
+      }
+      if (input.mode !== "upsert" && input.mode !== "replace") {
+        throw new Error(`Invalid commit mode "${String(input.mode)}"`);
+      }
+      const files = normalizeCommitFiles(input.files, input.mode);
+
+      console.info(
+        `[github] committing ${files.length} file(s) to ${fullName}@${branchName} (${input.mode})`,
+      );
+      const github = createInstallationOctokit(config, installationId);
+
+      try {
+        const headSha = await resolveRefSha(github, owner, repo, branchName);
+        const headCommit = await github.rest.git.getCommit({
+          owner,
+          repo,
+          commit_sha: headSha,
+        });
+
+        const treeItems: Array<{
+          path: string;
+          mode: "100644";
+          type: "blob";
+          sha: string | null;
+        }> = [];
+
+        for (const file of files) {
+          if (file.content === null) {
+            treeItems.push({
+              path: file.path,
+              mode: "100644",
+              type: "blob",
+              sha: null,
+            });
+            continue;
+          }
+
+          const blob = await github.rest.git.createBlob({
+            owner,
+            repo,
+            content: Buffer.from(file.content, "utf8").toString("base64"),
+            encoding: "base64",
+          });
+          treeItems.push({
+            path: file.path,
+            mode: "100644",
+            type: "blob",
+            sha: blob.data.sha,
+          });
+        }
+
+        const tree = await github.rest.git.createTree({
+          owner,
+          repo,
+          ...(input.mode === "upsert"
+            ? { base_tree: headCommit.data.tree.sha }
+            : {}),
+          tree: treeItems,
+        });
+
+        const commit = await github.rest.git.createCommit({
+          owner,
+          repo,
+          message,
+          tree: tree.data.sha,
+          parents: [headSha],
+        });
+
+        await github.rest.git.updateRef({
+          owner,
+          repo,
+          ref: `heads/${branchName}`,
+          sha: commit.data.sha,
+        });
+
+        const changedPaths = files.map((file) => file.path);
+        console.info(
+          `[github] committed ${commit.data.sha.slice(0, 7)} to ${fullName}@${branchName}: ${changedPaths.join(", ")}`,
+        );
+
+        return {
+          branch: branchName,
+          sha: commit.data.sha,
+          message,
+          mode: input.mode,
+          changedPaths,
+        };
+      } catch (error) {
+        const detail = formatGitHubError(error);
+        console.error(
+          `[github] failed to commit to ${fullName}@${branchName}: ${detail}`,
+        );
+        throw new Error(
+          `Failed to commit to ${fullName}@${branchName}: ${detail}`,
+          { cause: error },
+        );
+      }
+    },
+
+    async createPullRequest(installationId, fullName, input) {
+      const { owner, repo } = parseRepositoryFullName(fullName);
+      const head = validateBranchName(input.head);
+      const title = input.title.trim();
+      if (!title) {
+        throw new Error("Pull request title cannot be empty");
+      }
+
+      console.info(
+        `[github] creating pull request on ${fullName} from ${head}`,
+      );
+      const github = createInstallationOctokit(config, installationId);
+
+      try {
+        const repoResponse = await github.rest.repos.get({ owner, repo });
+        const base = validateBranchName(
+          input.base?.trim() || repoResponse.data.default_branch,
+        );
+
+        const pull = await github.rest.pulls.create({
+          owner,
+          repo,
+          title,
+          head,
+          base,
+          body: input.body?.trim() || undefined,
+        });
+
+        console.info(
+          `[github] created pull request #${pull.data.number} on ${fullName}`,
+        );
+        return {
+          number: pull.data.number,
+          url: pull.data.html_url,
+          title: pull.data.title,
+          head,
+          base,
+        };
+      } catch (error) {
+        const detail = formatGitHubError(error);
+        console.error(
+          `[github] failed to create pull request on ${fullName}: ${detail}`,
+        );
+        throw new Error(
+          `Failed to create pull request on ${fullName}: ${detail}`,
+          { cause: error },
+        );
       }
     },
   };

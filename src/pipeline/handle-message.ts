@@ -8,7 +8,7 @@ import type {
 } from "../model/conversation.ts";
 import { fallbackConversationTurn } from "../model/conversation.ts";
 
-const MAX_TOOL_ITERATIONS = 4;
+const MAX_TOOL_ITERATIONS = 6;
 
 export interface InboundTextMessage {
   platform: string;
@@ -58,6 +58,7 @@ export class RelayMessagePipeline {
       [];
     let turn: ConversationTurnOutput = fallbackConversationTurn();
     let connectUrl: string | null = null;
+    let pullRequestUrl: string | null = null;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
       const githubConnected = state.github !== null;
@@ -75,6 +76,7 @@ export class RelayMessagePipeline {
           canSelectRepository: githubConnected,
           canListBranches: githubConnected && hasActiveRepo,
           canInspectRepository: githubConnected && hasActiveRepo,
+          canWriteRepository: githubConnected && hasActiveRepo,
         },
         toolResults,
       });
@@ -269,12 +271,117 @@ export class RelayMessagePipeline {
             },
           });
         }
+        continue;
+      }
+
+      if (turn.action === "create_branch") {
+        try {
+          const created = await this.githubRepos.createBranch(
+            state.github.installationId,
+            state.activeRepo,
+            turn.branch ?? "",
+            state.activeBranch ?? undefined,
+          );
+          await this.repository.setActiveBranch(
+            identity.conversationId,
+            created.branch,
+          );
+          state = {
+            ...state,
+            activeBranch: created.branch,
+          };
+          toolResults.push({
+            action: "create_branch",
+            result: created,
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "create_branch",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to create branch",
+            },
+          });
+        }
+        continue;
+      }
+
+      if (turn.action === "commit_files") {
+        try {
+          const committed = await this.githubRepos.commitFiles(
+            state.github.installationId,
+            state.activeRepo,
+            {
+              branch: turn.branch ?? state.activeBranch ?? "",
+              message: turn.commitMessage ?? "",
+              mode: turn.commitMode ?? "upsert",
+              files: turn.files ?? [],
+            },
+          );
+          await this.repository.setActiveBranch(
+            identity.conversationId,
+            committed.branch,
+          );
+          state = {
+            ...state,
+            activeBranch: committed.branch,
+          };
+          toolResults.push({
+            action: "commit_files",
+            result: committed,
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "commit_files",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to commit files",
+            },
+          });
+        }
+        continue;
+      }
+
+      if (turn.action === "create_pull_request") {
+        try {
+          const pull = await this.githubRepos.createPullRequest(
+            state.github.installationId,
+            state.activeRepo,
+            {
+              head: turn.branch ?? state.activeBranch ?? "",
+              title: turn.prTitle ?? "",
+              body: turn.prBody,
+            },
+          );
+          pullRequestUrl = pull.url;
+          toolResults.push({
+            action: "create_pull_request",
+            result: pull,
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "create_pull_request",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to create pull request",
+            },
+          });
+        }
       }
     }
 
-    const reply = connectUrl
-      ? `${turn.reply}\n\nConnect GitHub:\n${connectUrl}`
-      : turn.reply;
+    let reply = turn.reply;
+    if (connectUrl) {
+      reply = `${reply}\n\nConnect GitHub:\n${connectUrl}`;
+    } else if (pullRequestUrl) {
+      reply = `${reply}\n\nPull request:\n${pullRequestUrl}`;
+    }
 
     await message.send(reply);
 
@@ -282,7 +389,11 @@ export class RelayMessagePipeline {
       status: "replied",
       userId: identity.userId,
       conversationId: identity.conversationId,
-      action: connectUrl ? "offer_github_connect" : turn.action,
+      action: connectUrl
+        ? "offer_github_connect"
+        : pullRequestUrl
+          ? "create_pull_request"
+          : turn.action,
     };
   }
 }
