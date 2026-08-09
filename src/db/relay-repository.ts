@@ -49,6 +49,7 @@ export interface ConversationState {
   conversationId: string;
   userId: string;
   activeRepo: string | null;
+  activeBranch: string | null;
   github: GitHubConnection | null;
   pendingGithubConfirmation: boolean;
 }
@@ -63,6 +64,7 @@ interface ConversationStateRow {
   id: string;
   user_id: string;
   active_repo: string | null;
+  active_branch: string | null;
   github_confirmation_pending: boolean;
 }
 
@@ -128,6 +130,7 @@ export interface RelayRepository {
     conversationId: string;
   }): Promise<ConversationState>;
   setActiveRepo(conversationId: string, activeRepo: string): Promise<void>;
+  setActiveBranch(conversationId: string, activeBranch: string): Promise<void>;
   getNotificationTarget(conversationId: string): Promise<NotificationTarget | null>;
   markGitHubConfirmationPending(conversationId: string): Promise<void>;
   consumeGitHubConfirmation(conversationId: string): Promise<boolean>;
@@ -288,7 +291,7 @@ export class SupabaseRelayRepository implements RelayRepository {
   }): Promise<ConversationState> {
     const { data: conversation, error: conversationError } = await this.client
       .from("conversations")
-      .select("id, user_id, active_repo, github_confirmation_pending")
+      .select("id, user_id, active_repo, active_branch, github_confirmation_pending")
       .eq("id", input.conversationId)
       .eq("user_id", input.userId)
       .maybeSingle();
@@ -329,6 +332,7 @@ export class SupabaseRelayRepository implements RelayRepository {
       conversationId: row.id,
       userId: row.user_id,
       activeRepo: row.active_repo,
+      activeBranch: row.active_branch,
       github,
       pendingGithubConfirmation: row.github_confirmation_pending,
     };
@@ -339,11 +343,27 @@ export class SupabaseRelayRepository implements RelayRepository {
       .from("conversations")
       .update({
         active_repo: activeRepo,
+        active_branch: null,
         updated_at: new Date().toISOString(),
       })
       .eq("id", conversationId);
 
     if (error) throw repositoryError("Failed to set active repository", error);
+  }
+
+  async setActiveBranch(
+    conversationId: string,
+    activeBranch: string,
+  ): Promise<void> {
+    const { error } = await this.client
+      .from("conversations")
+      .update({
+        active_branch: activeBranch,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", conversationId);
+
+    if (error) throw repositoryError("Failed to set active branch", error);
   }
 
   async getNotificationTarget(

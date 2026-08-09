@@ -20,6 +20,7 @@ interface StoredAuthSession extends AuthSession {
 interface StoredConversation {
   userId: string;
   activeRepo: string | null;
+  activeBranch: string | null;
 }
 
 export class FakeRelayRepository implements RelayRepository {
@@ -50,6 +51,7 @@ export class FakeRelayRepository implements RelayRepository {
       this.conversations.set(conversationId, {
         userId,
         activeRepo: null,
+        activeBranch: null,
       });
     }
 
@@ -156,6 +158,7 @@ export class FakeRelayRepository implements RelayRepository {
       conversationId: input.conversationId,
       userId: input.userId,
       activeRepo: conversation.activeRepo,
+      activeBranch: conversation.activeBranch,
       github: connection
         ? {
             installationId: connection.installationId,
@@ -174,6 +177,16 @@ export class FakeRelayRepository implements RelayRepository {
     const conversation = this.conversations.get(conversationId);
     if (!conversation) throw new Error("Conversation not found");
     conversation.activeRepo = activeRepo;
+    conversation.activeBranch = null;
+  }
+
+  async setActiveBranch(
+    conversationId: string,
+    activeBranch: string,
+  ): Promise<void> {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation) throw new Error("Conversation not found");
+    conversation.activeBranch = activeBranch;
   }
 
   async getNotificationTarget(): Promise<NotificationTarget | null> {

@@ -8,7 +8,7 @@ import type {
 } from "../model/conversation.ts";
 import { fallbackConversationTurn } from "../model/conversation.ts";
 
-const MAX_TOOL_ITERATIONS = 3;
+const MAX_TOOL_ITERATIONS = 4;
 
 export interface InboundTextMessage {
   platform: string;
@@ -60,16 +60,21 @@ export class RelayMessagePipeline {
     let connectUrl: string | null = null;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
+      const githubConnected = state.github !== null;
+      const hasActiveRepo = state.activeRepo !== null;
       turn = await this.conversation.turn({
         userText: message.text,
         context: {
           firstContact: identity.isNewUser && iteration === 0,
-          githubConnected: state.github !== null,
+          githubConnected,
           githubLogin: state.github?.githubLogin ?? null,
           activeRepo: state.activeRepo,
+          activeBranch: state.activeBranch,
           pendingGithubConfirmation: state.pendingGithubConfirmation,
-          canListRepositories: state.github !== null,
-          canSelectRepository: state.github !== null,
+          canListRepositories: githubConnected,
+          canSelectRepository: githubConnected,
+          canListBranches: githubConnected && hasActiveRepo,
+          canInspectRepository: githubConnected && hasActiveRepo,
         },
         toolResults,
       });
@@ -140,6 +145,7 @@ export class RelayMessagePipeline {
           state = {
             ...state,
             activeRepo: selected.fullName,
+            activeBranch: null,
           };
           toolResults.push({
             action: "select_repository",
@@ -153,6 +159,113 @@ export class RelayMessagePipeline {
                 error instanceof Error
                   ? error.message
                   : "Failed to select repository",
+            },
+          });
+        }
+        continue;
+      }
+
+      if (!state.activeRepo) {
+        toolResults.push({
+          action: turn.action,
+          result: {
+            error: "No active repository is selected for this conversation.",
+          },
+        });
+        continue;
+      }
+
+      if (turn.action === "list_branches") {
+        try {
+          const branches = await this.githubRepos.listBranches(
+            state.github.installationId,
+            state.activeRepo,
+          );
+          toolResults.push({
+            action: "list_branches",
+            result: branches,
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "list_branches",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to list branches",
+            },
+          });
+        }
+        continue;
+      }
+
+      if (turn.action === "select_branch") {
+        try {
+          const branchList = await this.githubRepos.listBranches(
+            state.github.installationId,
+            state.activeRepo,
+          );
+          const requested = turn.branch?.trim() ?? "";
+          const matched = branchList.branches.find(
+            (branch) => branch.name.toLowerCase() === requested.toLowerCase(),
+          );
+          if (!matched) {
+            toolResults.push({
+              action: "select_branch",
+              result: {
+                error: `No branch matched "${turn.branch}".`,
+                defaultBranch: branchList.defaultBranch,
+                branches: branchList.branches.map((branch) => branch.name),
+              },
+            });
+            continue;
+          }
+
+          await this.repository.setActiveBranch(
+            identity.conversationId,
+            matched.name,
+          );
+          state = {
+            ...state,
+            activeBranch: matched.name,
+          };
+          toolResults.push({
+            action: "select_branch",
+            result: { selected: matched.name },
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "select_branch",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to select branch",
+            },
+          });
+        }
+        continue;
+      }
+
+      if (turn.action === "inspect_repository") {
+        try {
+          const inspection = await this.githubRepos.inspectRepository(
+            state.github.installationId,
+            state.activeRepo,
+            turn.branch ?? state.activeBranch ?? undefined,
+          );
+          toolResults.push({
+            action: "inspect_repository",
+            result: inspection,
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "inspect_repository",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to inspect repository",
             },
           });
         }
