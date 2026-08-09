@@ -6,19 +6,22 @@ import { createSupabaseClient } from "./db/client.ts";
 import { SupabaseRelayRepository } from "./db/relay-repository.ts";
 import { GitHubAuthStateService } from "./github/auth-state.ts";
 import { createGitHubCallbackHandler } from "./github/callback.ts";
-import { OpenRouterOnboardingGenerator } from "./model/onboarding.ts";
+import { createInstallationReposClient } from "./github/repos.ts";
+import { OpenRouterConversationModel } from "./model/conversation.ts";
 import { RelayMessagePipeline } from "./pipeline/handle-message.ts";
 
 const config = loadConfig();
 const repository = new SupabaseRelayRepository(
   createSupabaseClient(config.supabase),
 );
-const onboarding = new OpenRouterOnboardingGenerator(config.openRouter);
+const conversation = new OpenRouterConversationModel(config.openRouter);
 const githubAuth = new GitHubAuthStateService(repository, config.github);
+const githubRepos = createInstallationReposClient(config.github);
 const pipeline = new RelayMessagePipeline(
   repository,
-  onboarding,
+  conversation,
   githubAuth,
+  githubRepos,
 );
 
 const app = await Spectrum({
@@ -34,13 +37,14 @@ Bun.serve({
     repository,
     notifyConnected: async (conversationId) => {
       const target = await repository.getNotificationTarget(conversationId);
-      if (!target || target.platform !== "iMessage") return false;
+      if (!target || target.platform !== "iMessage") {
+        return false;
+      }
 
-      const iMessage = imessage(app);
-      const user = await iMessage.user(target.externalUserId);
-      const space = await iMessage.space.create(user);
+      const im = imessage(app);
+      const space = await im.space.get(target.externalSpaceId);
       await space.send(
-        "GitHub is connected. Next, text me the repository you want Relay to use.",
+        "GitHub connected successfully. Which repository should we use?",
       );
       return true;
     },
@@ -57,7 +61,7 @@ for await (const [space, message] of app.messages) {
   }
 
   try {
-    const result = await pipeline.handle({
+    await pipeline.handle({
       platform: message.platform,
       senderId: message.sender.id,
       spaceId: space.id,
@@ -66,12 +70,6 @@ for await (const [space, message] of app.messages) {
         await space.send(text);
       },
     });
-
-    if (result.status === "ready" && !result.confirmationSent) {
-      await space.send(
-        "GitHub is connected. Repository and project setup is the next onboarding step.",
-      );
-    }
   } catch (error) {
     console.error(
       "Relay message pipeline failed:",

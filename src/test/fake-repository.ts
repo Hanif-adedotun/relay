@@ -1,5 +1,6 @@
 import type {
   AuthSession,
+  ConversationState,
   GitHubConnectionInput,
   GitHubInstallationCandidate,
   NotificationTarget,
@@ -16,9 +17,15 @@ interface StoredAuthSession extends AuthSession {
   installations?: GitHubInstallationCandidate[];
 }
 
+interface StoredConversation {
+  userId: string;
+  activeRepo: string | null;
+}
+
 export class FakeRelayRepository implements RelayRepository {
   readonly identities = new Map<string, string>();
-  readonly conversations = new Map<string, string>();
+  readonly spaceToConversation = new Map<string, string>();
+  readonly conversations = new Map<string, StoredConversation>();
   readonly authSessions = new Map<string, StoredAuthSession>();
   readonly connections: GitHubConnectionInput[] = [];
   readonly pendingConfirmations = new Set<string>();
@@ -35,10 +42,16 @@ export class FakeRelayRepository implements RelayRepository {
     userId ??= crypto.randomUUID();
     this.identities.set(identityKey, userId);
 
-    const conversationKey = `${userId}:${input.platform}:${input.externalSpaceId}`;
-    let conversationId = this.conversations.get(conversationKey);
-    conversationId ??= crypto.randomUUID();
-    this.conversations.set(conversationKey, conversationId);
+    const spaceKey = `${userId}:${input.platform}:${input.externalSpaceId}`;
+    let conversationId = this.spaceToConversation.get(spaceKey);
+    if (!conversationId) {
+      conversationId = crypto.randomUUID();
+      this.spaceToConversation.set(spaceKey, conversationId);
+      this.conversations.set(conversationId, {
+        userId,
+        activeRepo: null,
+      });
+    }
 
     return { userId, conversationId, isNewUser };
   }
@@ -124,6 +137,43 @@ export class FakeRelayRepository implements RelayRepository {
 
   async saveGitHubConnection(input: GitHubConnectionInput): Promise<void> {
     this.connections.push(input);
+  }
+
+  async getConversationState(input: {
+    userId: string;
+    conversationId: string;
+  }): Promise<ConversationState> {
+    const conversation = this.conversations.get(input.conversationId);
+    if (!conversation || conversation.userId !== input.userId) {
+      throw new Error("Conversation not found");
+    }
+
+    const connection = this.connections.find(
+      (candidate) => candidate.userId === input.userId,
+    );
+
+    return {
+      conversationId: input.conversationId,
+      userId: input.userId,
+      activeRepo: conversation.activeRepo,
+      github: connection
+        ? {
+            installationId: connection.installationId,
+            githubUserId: connection.githubUserId,
+            githubLogin: connection.githubLogin,
+            repositorySelection: connection.repositorySelection,
+          }
+        : null,
+      pendingGithubConfirmation: this.pendingConfirmations.has(
+        input.conversationId,
+      ),
+    };
+  }
+
+  async setActiveRepo(conversationId: string, activeRepo: string): Promise<void> {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation) throw new Error("Conversation not found");
+    conversation.activeRepo = activeRepo;
   }
 
   async getNotificationTarget(): Promise<NotificationTarget | null> {

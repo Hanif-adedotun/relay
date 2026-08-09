@@ -1,6 +1,14 @@
 import type { RelayRepository } from "../db/relay-repository.ts";
 import type { GitHubAuthStateService } from "../github/auth-state.ts";
-import type { OnboardingGenerator } from "../model/onboarding.ts";
+import type { GitHubReposClient } from "../github/repos.ts";
+import type {
+  ConversationAction,
+  ConversationModel,
+  ConversationTurnOutput,
+} from "../model/conversation.ts";
+import { fallbackConversationTurn } from "../model/conversation.ts";
+
+const MAX_TOOL_ITERATIONS = 3;
 
 export interface InboundTextMessage {
   platform: string;
@@ -10,20 +18,19 @@ export interface InboundTextMessage {
   send(text: string): Promise<void>;
 }
 
-export type MessageGateResult =
-  | { status: "awaiting_github" }
-  | {
-      status: "ready";
-      userId: string;
-      conversationId: string;
-      confirmationSent: boolean;
-    };
+export type MessageGateResult = {
+  status: "replied";
+  userId: string;
+  conversationId: string;
+  action: ConversationAction;
+};
 
 export class RelayMessagePipeline {
   constructor(
     private readonly repository: RelayRepository,
-    private readonly onboarding: OnboardingGenerator,
+    private readonly conversation: ConversationModel,
     private readonly githubAuth: GitHubAuthStateService,
+    private readonly githubRepos: GitHubReposClient,
   ) {}
 
   async handle(message: InboundTextMessage): Promise<MessageGateResult> {
@@ -33,34 +40,136 @@ export class RelayMessagePipeline {
       externalSpaceId: message.spaceId,
     });
 
-    const connected = await this.repository.hasGitHubConnection(identity.userId);
-    if (!connected) {
-      const [copy, installUrl] = await Promise.all([
-        this.onboarding.generate({ firstContact: identity.isNewUser }),
-        this.githubAuth.createAuthorizationUrl({
-          userId: identity.userId,
-          conversationId: identity.conversationId,
-        }),
-      ]);
-
-      await message.send(`${copy}\n\nConnect GitHub:\n${installUrl}`);
-      return { status: "awaiting_github" };
-    }
-
-    const confirmationPending =
-      await this.repository.consumeGitHubConfirmation(identity.conversationId);
-
-    if (confirmationPending) {
-      await message.send(
-        "GitHub is connected. Next, tell me which repository you want Relay to use.",
-      );
-    }
-
-    return {
-      status: "ready",
+    let state = await this.repository.getConversationState({
       userId: identity.userId,
       conversationId: identity.conversationId,
-      confirmationSent: confirmationPending,
+    });
+
+    const pendingGithubConfirmation =
+      await this.repository.consumeGitHubConfirmation(identity.conversationId);
+    if (pendingGithubConfirmation) {
+      state = {
+        ...state,
+        pendingGithubConfirmation: true,
+      };
+    }
+
+    const toolResults: Array<{ action: ConversationAction; result: unknown }> =
+      [];
+    let turn: ConversationTurnOutput = fallbackConversationTurn();
+    let connectUrl: string | null = null;
+
+    for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
+      turn = await this.conversation.turn({
+        userText: message.text,
+        context: {
+          firstContact: identity.isNewUser && iteration === 0,
+          githubConnected: state.github !== null,
+          githubLogin: state.github?.githubLogin ?? null,
+          activeRepo: state.activeRepo,
+          pendingGithubConfirmation: state.pendingGithubConfirmation,
+          canListRepositories: state.github !== null,
+          canSelectRepository: state.github !== null,
+        },
+        toolResults,
+      });
+
+      if (turn.action === "none") break;
+
+      if (turn.action === "offer_github_connect") {
+        connectUrl = await this.githubAuth.createAuthorizationUrl({
+          userId: identity.userId,
+          conversationId: identity.conversationId,
+        });
+        break;
+      }
+
+      if (!state.github) {
+        toolResults.push({
+          action: turn.action,
+          result: {
+            error: "GitHub is not connected for this user.",
+          },
+        });
+        continue;
+      }
+
+      if (turn.action === "list_repositories") {
+        try {
+          const repositories = await this.githubRepos.listRepositories(
+            state.github.installationId,
+          );
+          toolResults.push({
+            action: "list_repositories",
+            result: { repositories },
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "list_repositories",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to list repositories",
+            },
+          });
+        }
+        continue;
+      }
+
+      if (turn.action === "select_repository") {
+        try {
+          const selected = await this.githubRepos.findRepository(
+            state.github.installationId,
+            turn.repository ?? "",
+          );
+          if (!selected) {
+            toolResults.push({
+              action: "select_repository",
+              result: {
+                error: `No accessible repository matched "${turn.repository}".`,
+              },
+            });
+            continue;
+          }
+
+          await this.repository.setActiveRepo(
+            identity.conversationId,
+            selected.fullName,
+          );
+          state = {
+            ...state,
+            activeRepo: selected.fullName,
+          };
+          toolResults.push({
+            action: "select_repository",
+            result: { selected: selected.fullName },
+          });
+        } catch (error) {
+          toolResults.push({
+            action: "select_repository",
+            result: {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Failed to select repository",
+            },
+          });
+        }
+      }
+    }
+
+    const reply = connectUrl
+      ? `${turn.reply}\n\nConnect GitHub:\n${connectUrl}`
+      : turn.reply;
+
+    await message.send(reply);
+
+    return {
+      status: "replied",
+      userId: identity.userId,
+      conversationId: identity.conversationId,
+      action: connectUrl ? "offer_github_connect" : turn.action,
     };
   }
 }

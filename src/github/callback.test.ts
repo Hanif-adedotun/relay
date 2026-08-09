@@ -82,6 +82,41 @@ describe("GitHub callback", () => {
     expect(repository.pendingConfirmations.has("conversation-1")).toBeTrue();
   });
 
+  test("skips pending confirmation when notifyConnected succeeds", async () => {
+    const repository = new FakeRelayRepository();
+    addSession(repository, "notified-state");
+    const notified: string[] = [];
+    const handler = createGitHubCallbackHandler({
+      config,
+      repository,
+      verifier: {
+        authorize: async () => ({
+          githubUserId: 7,
+          githubLogin: "octocat",
+          installations: [
+            {
+              id: 42,
+              accountLogin: "octocat",
+              accountType: "User",
+              repositorySelection: "selected",
+            },
+          ],
+        }),
+      },
+      now: () => now,
+      notifyConnected: async (conversationId) => {
+        notified.push(conversationId);
+        return true;
+      },
+    });
+
+    const response = await handler(callbackRequest("notified-state"));
+
+    expect(response.status).toBe(200);
+    expect(notified).toEqual(["conversation-1"]);
+    expect(repository.pendingConfirmations.has("conversation-1")).toBeFalse();
+  });
+
   test("continues to installation when the authorized user has none", async () => {
     const repository = new FakeRelayRepository();
     addSession(repository, "new-install-state");

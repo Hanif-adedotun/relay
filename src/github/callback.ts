@@ -152,6 +152,7 @@ export function createGitHubCallbackHandler(
       now: now(),
     });
     if (!session) {
+      
       return htmlResponse(
         "This GitHub connection is invalid, expired, or was already used. Text Relay for a new link.",
         400,

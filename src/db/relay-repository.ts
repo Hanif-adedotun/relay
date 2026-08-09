@@ -35,12 +35,42 @@ export interface GitHubConnectionInput {
 export interface NotificationTarget {
   platform: string;
   externalUserId: string;
+  externalSpaceId: string;
+}
+
+export interface GitHubConnection {
+  installationId: number;
+  githubUserId: number;
+  githubLogin: string;
+  repositorySelection: "all" | "selected";
+}
+
+export interface ConversationState {
+  conversationId: string;
+  userId: string;
+  activeRepo: string | null;
+  github: GitHubConnection | null;
+  pendingGithubConfirmation: boolean;
 }
 
 interface ResolveIdentityRow {
   user_id: string;
   conversation_id: string;
   is_new_user: boolean;
+}
+
+interface ConversationStateRow {
+  id: string;
+  user_id: string;
+  active_repo: string | null;
+  github_confirmation_pending: boolean;
+}
+
+interface GitHubConnectionRow {
+  installation_id: number;
+  github_user_id: number;
+  github_login: string;
+  repository_selection: "all" | "selected";
 }
 
 interface AuthSessionRow {
@@ -93,6 +123,11 @@ export interface RelayRepository {
     now: Date;
   }): Promise<VerifiedAuthSession | null>;
   saveGitHubConnection(input: GitHubConnectionInput): Promise<void>;
+  getConversationState(input: {
+    userId: string;
+    conversationId: string;
+  }): Promise<ConversationState>;
+  setActiveRepo(conversationId: string, activeRepo: string): Promise<void>;
   getNotificationTarget(conversationId: string): Promise<NotificationTarget | null>;
   markGitHubConfirmationPending(conversationId: string): Promise<void>;
   consumeGitHubConfirmation(conversationId: string): Promise<boolean>;
@@ -247,12 +282,76 @@ export class SupabaseRelayRepository implements RelayRepository {
     if (error) throw new Error("Failed to save GitHub connection", { cause: error });
   }
 
+  async getConversationState(input: {
+    userId: string;
+    conversationId: string;
+  }): Promise<ConversationState> {
+    const { data: conversation, error: conversationError } = await this.client
+      .from("conversations")
+      .select("id, user_id, active_repo, github_confirmation_pending")
+      .eq("id", input.conversationId)
+      .eq("user_id", input.userId)
+      .maybeSingle();
+
+    if (conversationError) {
+      throw repositoryError("Failed to load conversation state", conversationError);
+    }
+    if (!conversation) {
+      throw new Error("Conversation not found");
+    }
+
+    const row = conversation as ConversationStateRow;
+    const { data: connection, error: connectionError } = await this.client
+      .from("github_connections")
+      .select(
+        "installation_id, github_user_id, github_login, repository_selection",
+      )
+      .eq("user_id", input.userId)
+      .order("connected_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (connectionError) {
+      throw repositoryError("Failed to load GitHub connection", connectionError);
+    }
+
+    const github = connection
+      ? {
+          installationId: (connection as GitHubConnectionRow).installation_id,
+          githubUserId: (connection as GitHubConnectionRow).github_user_id,
+          githubLogin: (connection as GitHubConnectionRow).github_login,
+          repositorySelection: (connection as GitHubConnectionRow)
+            .repository_selection,
+        }
+      : null;
+
+    return {
+      conversationId: row.id,
+      userId: row.user_id,
+      activeRepo: row.active_repo,
+      github,
+      pendingGithubConfirmation: row.github_confirmation_pending,
+    };
+  }
+
+  async setActiveRepo(conversationId: string, activeRepo: string): Promise<void> {
+    const { error } = await this.client
+      .from("conversations")
+      .update({
+        active_repo: activeRepo,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", conversationId);
+
+    if (error) throw repositoryError("Failed to set active repository", error);
+  }
+
   async getNotificationTarget(
     conversationId: string,
   ): Promise<NotificationTarget | null> {
     const { data: conversation, error: conversationError } = await this.client
       .from("conversations")
-      .select("user_id, platform")
+      .select("user_id, platform, external_space_id")
       .eq("id", conversationId)
       .maybeSingle();
 
@@ -280,6 +379,7 @@ export class SupabaseRelayRepository implements RelayRepository {
     return {
       platform: conversation.platform,
       externalUserId: identity.external_user_id,
+      externalSpaceId: conversation.external_space_id,
     };
   }
 
