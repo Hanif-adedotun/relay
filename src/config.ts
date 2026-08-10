@@ -10,6 +10,7 @@ export interface RelayConfig {
   openRouter: {
     apiKey: string;
     model: string;
+    embeddingModel: string;
   };
   github: {
     appId: string;
@@ -65,6 +66,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
     openRouter: {
       apiKey: required(env, "OPENROUTER_API_KEY"),
       model: required(env, "OPENROUTER_MODEL"),
+      embeddingModel:
+        env.OPENROUTER_EMBEDDING_MODEL?.trim() ||
+        "openai/text-embedding-3-small",
     },
     github: {
       appId: required(env, "GITHUB_APP_ID"),

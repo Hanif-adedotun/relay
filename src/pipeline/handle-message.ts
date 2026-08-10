@@ -1,14 +1,22 @@
 import type { RelayRepository } from "../db/relay-repository.ts";
 import type { GitHubAuthStateService } from "../github/auth-state.ts";
 import type { GitHubReposClient } from "../github/repos.ts";
+import type { EmbeddingClient } from "../memory/embeddings.ts";
+import {
+  buildTurnMemoryChunk,
+  retrieveMemory,
+} from "../memory/retrieve.ts";
 import type {
   ConversationAction,
+  ConversationHistoryMessage,
   ConversationModel,
   ConversationTurnOutput,
 } from "../model/conversation.ts";
 import { fallbackConversationTurn } from "../model/conversation.ts";
 
 const MAX_TOOL_ITERATIONS = 6;
+const MAX_PROGRESS_ERROR_CHARS = 160;
+const RECENT_MESSAGE_LIMIT = 20;
 
 export interface InboundTextMessage {
   platform: string;
@@ -25,12 +33,86 @@ export type MessageGateResult = {
   action: ConversationAction;
 };
 
+export function progressBeforeAction(
+  action: ConversationAction,
+  turn: ConversationTurnOutput,
+): string | null {
+  switch (action) {
+    case "create_branch": {
+      const name = turn.branch?.trim();
+      return name ? `Creating branch ${name}…` : "Creating branch…";
+    }
+    case "commit_files":
+      return "Committing changes…";
+    case "create_pull_request":
+      return "Opening pull request…";
+    case "offer_github_connect":
+      return "Preparing a GitHub connect link…";
+    default:
+      return null;
+  }
+}
+
+export function progressAfterSuccess(
+  action: ConversationAction,
+  detail?: {
+    branch?: string;
+    changedPaths?: string[];
+  },
+): string | null {
+  switch (action) {
+    case "create_branch": {
+      const name = detail?.branch?.trim();
+      return name ? `Created ${name}.` : "Created branch.";
+    }
+    case "commit_files": {
+      const paths = detail?.changedPaths ?? [];
+      if (paths.length === 0) return "Committed changes.";
+      const shown = paths.slice(0, 3).join(", ");
+      const extra = paths.length > 3 ? ` (+${paths.length - 3} more)` : "";
+      return `Committed ${shown}${extra}.`;
+    }
+    case "create_pull_request":
+    case "offer_github_connect":
+      return null;
+    default:
+      return null;
+  }
+}
+
+export function progressAfterFailure(
+  action: ConversationAction,
+  error: string,
+): string | null {
+  const verb =
+    action === "create_branch"
+      ? "create the branch"
+      : action === "commit_files"
+        ? "commit changes"
+        : action === "create_pull_request"
+          ? "open the pull request"
+          : action === "offer_github_connect"
+            ? "prepare the connect link"
+            : null;
+  if (!verb) return null;
+
+  const short = error
+    .replace(/\b(?:https?:\/\/|www\.|github\.com\/)\S*/giu, "")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, MAX_PROGRESS_ERROR_CHARS);
+  return short
+    ? `Couldn’t ${verb}: ${short}`
+    : `Couldn’t ${verb}.`;
+}
+
 export class RelayMessagePipeline {
   constructor(
     private readonly repository: RelayRepository,
     private readonly conversation: ConversationModel,
     private readonly githubAuth: GitHubAuthStateService,
     private readonly githubRepos: GitHubReposClient,
+    private readonly embeddings: EmbeddingClient,
   ) {}
 
   async handle(message: InboundTextMessage): Promise<MessageGateResult> {
@@ -54,11 +136,46 @@ export class RelayMessagePipeline {
       };
     }
 
+    const recentMessages = await this.repository.listRecentMessages(
+      identity.conversationId,
+      RECENT_MESSAGE_LIMIT,
+    );
+    const recentForModel: ConversationHistoryMessage[] = recentMessages.map(
+      (entry) => ({
+        role: entry.role,
+        content: entry.content,
+      }),
+    );
+    const retrievedMemory = await retrieveMemory({
+      repository: this.repository,
+      embeddings: this.embeddings,
+      userId: identity.userId,
+      userText: message.text,
+      recentMessages,
+      activeRepo: state.activeRepo,
+    });
+
+    const userMessage = await this.repository.appendMessage({
+      conversationId: identity.conversationId,
+      userId: identity.userId,
+      role: "user",
+      content: message.text,
+    });
+
     const toolResults: Array<{ action: ConversationAction; result: unknown }> =
       [];
+    const milestones: string[] = [];
     let turn: ConversationTurnOutput = fallbackConversationTurn();
     let connectUrl: string | null = null;
     let pullRequestUrl: string | null = null;
+    const progress = { last: null as string | null };
+
+    const sendProgress = async (text: string | null): Promise<void> => {
+      const trimmed = text?.trim();
+      if (!trimmed) return;
+      await message.send(trimmed);
+      progress.last = trimmed;
+    };
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
       const githubConnected = state.github !== null;
@@ -71,6 +188,9 @@ export class RelayMessagePipeline {
           githubLogin: state.github?.githubLogin ?? null,
           activeRepo: state.activeRepo,
           activeBranch: state.activeBranch,
+          lastPrNumber: state.lastPrNumber,
+          lastPrUrl: state.lastPrUrl,
+          lastCommitSha: state.lastCommitSha,
           pendingGithubConfirmation: state.pendingGithubConfirmation,
           canListRepositories: githubConnected,
           canSelectRepository: githubConnected,
@@ -78,16 +198,30 @@ export class RelayMessagePipeline {
           canInspectRepository: githubConnected && hasActiveRepo,
           canWriteRepository: githubConnected && hasActiveRepo,
         },
+        recentMessages: recentForModel,
+        retrievedMemory,
         toolResults,
       });
 
       if (turn.action === "none") break;
 
       if (turn.action === "offer_github_connect") {
-        connectUrl = await this.githubAuth.createAuthorizationUrl({
-          userId: identity.userId,
-          conversationId: identity.conversationId,
-        });
+        await sendProgress(progressBeforeAction(turn.action, turn));
+        try {
+          connectUrl = await this.githubAuth.createAuthorizationUrl({
+            userId: identity.userId,
+            conversationId: identity.conversationId,
+          });
+        } catch (error) {
+          await sendProgress(
+            progressAfterFailure(
+              turn.action,
+              error instanceof Error
+                ? error.message
+                : "Failed to prepare connect link",
+            ),
+          );
+        }
         break;
       }
 
@@ -275,6 +409,7 @@ export class RelayMessagePipeline {
       }
 
       if (turn.action === "create_branch") {
+        await sendProgress(progressBeforeAction(turn.action, turn));
         try {
           const created = await this.githubRepos.createBranch(
             state.github.installationId,
@@ -294,21 +429,26 @@ export class RelayMessagePipeline {
             action: "create_branch",
             result: created,
           });
+          milestones.push(`create_branch ${created.branch}`);
+          await sendProgress(
+            progressAfterSuccess(turn.action, { branch: created.branch }),
+          );
         } catch (error) {
+          const errorMessage =
+            error instanceof Error
+              ? error.message
+              : "Failed to create branch";
+          await sendProgress(progressAfterFailure(turn.action, errorMessage));
           toolResults.push({
             action: "create_branch",
-            result: {
-              error:
-                error instanceof Error
-                  ? error.message
-                  : "Failed to create branch",
-            },
+            result: { error: errorMessage },
           });
         }
         continue;
       }
 
       if (turn.action === "commit_files") {
+        await sendProgress(progressBeforeAction(turn.action, turn));
         try {
           const committed = await this.githubRepos.commitFiles(
             state.github.installationId,
@@ -332,21 +472,37 @@ export class RelayMessagePipeline {
             action: "commit_files",
             result: committed,
           });
+          milestones.push(
+            `commit_files ${committed.changedPaths.join(", ")}`,
+          );
+          await this.repository.updateWorkingMemory(identity.conversationId, {
+            lastCommitSha: committed.sha,
+          });
+          state = {
+            ...state,
+            lastCommitSha: committed.sha,
+          };
+          await sendProgress(
+            progressAfterSuccess(turn.action, {
+              changedPaths: committed.changedPaths,
+            }),
+          );
         } catch (error) {
+          const errorMessage =
+            error instanceof Error
+              ? error.message
+              : "Failed to commit files";
+          await sendProgress(progressAfterFailure(turn.action, errorMessage));
           toolResults.push({
             action: "commit_files",
-            result: {
-              error:
-                error instanceof Error
-                  ? error.message
-                  : "Failed to commit files",
-            },
+            result: { error: errorMessage },
           });
         }
         continue;
       }
 
       if (turn.action === "create_pull_request") {
+        await sendProgress(progressBeforeAction(turn.action, turn));
         try {
           const pull = await this.githubRepos.createPullRequest(
             state.github.installationId,
@@ -358,32 +514,89 @@ export class RelayMessagePipeline {
             },
           );
           pullRequestUrl = pull.url;
+          milestones.push(`create_pull_request #${pull.number}`);
+          await this.repository.updateWorkingMemory(identity.conversationId, {
+            lastPrNumber: pull.number,
+            lastPrUrl: pull.url,
+          });
+          state = {
+            ...state,
+            lastPrNumber: pull.number,
+            lastPrUrl: pull.url,
+          };
           toolResults.push({
             action: "create_pull_request",
             result: pull,
           });
         } catch (error) {
+          const errorMessage =
+            error instanceof Error
+              ? error.message
+              : "Failed to create pull request";
+          await sendProgress(progressAfterFailure(turn.action, errorMessage));
           toolResults.push({
             action: "create_pull_request",
-            result: {
-              error:
-                error instanceof Error
-                  ? error.message
-                  : "Failed to create pull request",
-            },
+            result: { error: errorMessage },
           });
         }
       }
     }
 
-    let reply = turn.reply;
+    const finalBody = turn.reply.trim();
+    const sameAsLastProgress =
+      progress.last !== null &&
+      finalBody.toLowerCase() === progress.last.toLowerCase();
+
+    let reply: string | null = sameAsLastProgress ? null : finalBody;
     if (connectUrl) {
-      reply = `${reply}\n\nConnect GitHub:\n${connectUrl}`;
+      const prefix = reply ?? "Connect GitHub to continue.";
+      reply = `${prefix}\n\nConnect GitHub:\n${connectUrl}`;
     } else if (pullRequestUrl) {
-      reply = `${reply}\n\nPull request:\n${pullRequestUrl}`;
+      const prefix = reply ?? "Pull request is ready.";
+      reply = `${prefix}\n\nPull request:\n${pullRequestUrl}`;
     }
 
-    await message.send(reply);
+    if (reply) {
+      await message.send(reply);
+    }
+
+    const assistantContent = reply ?? finalBody;
+    const assistantMessage = await this.repository.appendMessage({
+      conversationId: identity.conversationId,
+      userId: identity.userId,
+      role: "assistant",
+      content: assistantContent,
+      action: connectUrl
+        ? "offer_github_connect"
+        : pullRequestUrl
+          ? "create_pull_request"
+          : turn.action,
+    });
+
+    try {
+      const chunkText = buildTurnMemoryChunk({
+        userText: message.text,
+        assistantReply: assistantContent,
+        milestones,
+      });
+      const [embedding] = await this.embeddings.embedTexts([chunkText]);
+      if (embedding) {
+        await this.repository.insertMemoryChunk({
+          userId: identity.userId,
+          conversationId: identity.conversationId,
+          content: chunkText,
+          sourceMessageIds: [userMessage.id, assistantMessage.id],
+          repo: state.activeRepo,
+          branch: state.activeBranch,
+          embedding,
+        });
+      }
+    } catch (error) {
+      console.error(
+        "Failed to persist memory chunk:",
+        error instanceof Error ? error.message : "unknown error",
+      );
+    }
 
     return {
       status: "replied",

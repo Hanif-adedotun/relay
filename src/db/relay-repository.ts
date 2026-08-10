@@ -50,8 +50,52 @@ export interface ConversationState {
   userId: string;
   activeRepo: string | null;
   activeBranch: string | null;
+  lastPrNumber: number | null;
+  lastPrUrl: string | null;
+  lastCommitSha: string | null;
   github: GitHubConnection | null;
   pendingGithubConfirmation: boolean;
+}
+
+export type ConversationMessageRole = "user" | "assistant" | "system";
+
+export interface ConversationMessage {
+  id: string;
+  conversationId: string;
+  userId: string;
+  role: ConversationMessageRole;
+  content: string;
+  action: string | null;
+  createdAt: Date;
+}
+
+export interface WorkingMemoryUpdate {
+  lastPrNumber?: number | null;
+  lastPrUrl?: string | null;
+  lastCommitSha?: string | null;
+}
+
+export interface MemoryChunkInput {
+  userId: string;
+  conversationId: string;
+  content: string;
+  kind?: "turn";
+  sourceMessageIds: string[];
+  repo?: string | null;
+  branch?: string | null;
+  embedding: number[];
+}
+
+export interface MemoryChunkSearchResult {
+  id: string;
+  conversationId: string;
+  content: string;
+  kind: string;
+  sourceMessageIds: string[];
+  repo: string | null;
+  branch: string | null;
+  createdAt: Date;
+  distance: number;
 }
 
 interface ResolveIdentityRow {
@@ -65,6 +109,9 @@ interface ConversationStateRow {
   user_id: string;
   active_repo: string | null;
   active_branch: string | null;
+  last_pr_number: number | null;
+  last_pr_url: string | null;
+  last_commit_sha: string | null;
   github_confirmation_pending: boolean;
 }
 
@@ -131,6 +178,27 @@ export interface RelayRepository {
   }): Promise<ConversationState>;
   setActiveRepo(conversationId: string, activeRepo: string): Promise<void>;
   setActiveBranch(conversationId: string, activeBranch: string): Promise<void>;
+  updateWorkingMemory(
+    conversationId: string,
+    update: WorkingMemoryUpdate,
+  ): Promise<void>;
+  appendMessage(input: {
+    conversationId: string;
+    userId: string;
+    role: ConversationMessageRole;
+    content: string;
+    action?: string | null;
+  }): Promise<ConversationMessage>;
+  listRecentMessages(
+    conversationId: string,
+    limit?: number,
+  ): Promise<ConversationMessage[]>;
+  insertMemoryChunk(input: MemoryChunkInput): Promise<string>;
+  searchMemoryChunks(
+    userId: string,
+    embedding: number[],
+    limit?: number,
+  ): Promise<MemoryChunkSearchResult[]>;
   getNotificationTarget(conversationId: string): Promise<NotificationTarget | null>;
   markGitHubConfirmationPending(conversationId: string): Promise<void>;
   consumeGitHubConfirmation(conversationId: string): Promise<boolean>;
@@ -291,7 +359,9 @@ export class SupabaseRelayRepository implements RelayRepository {
   }): Promise<ConversationState> {
     const { data: conversation, error: conversationError } = await this.client
       .from("conversations")
-      .select("id, user_id, active_repo, active_branch, github_confirmation_pending")
+      .select(
+        "id, user_id, active_repo, active_branch, last_pr_number, last_pr_url, last_commit_sha, github_confirmation_pending",
+      )
       .eq("id", input.conversationId)
       .eq("user_id", input.userId)
       .maybeSingle();
@@ -333,6 +403,9 @@ export class SupabaseRelayRepository implements RelayRepository {
       userId: row.user_id,
       activeRepo: row.active_repo,
       activeBranch: row.active_branch,
+      lastPrNumber: row.last_pr_number,
+      lastPrUrl: row.last_pr_url,
+      lastCommitSha: row.last_commit_sha,
       github,
       pendingGithubConfirmation: row.github_confirmation_pending,
     };
@@ -364,6 +437,137 @@ export class SupabaseRelayRepository implements RelayRepository {
       .eq("id", conversationId);
 
     if (error) throw repositoryError("Failed to set active branch", error);
+  }
+
+  async updateWorkingMemory(
+    conversationId: string,
+    update: WorkingMemoryUpdate,
+  ): Promise<void> {
+    const patch: Record<string, unknown> = {
+      updated_at: new Date().toISOString(),
+    };
+    if ("lastPrNumber" in update) patch.last_pr_number = update.lastPrNumber;
+    if ("lastPrUrl" in update) patch.last_pr_url = update.lastPrUrl;
+    if ("lastCommitSha" in update) patch.last_commit_sha = update.lastCommitSha;
+
+    const { error } = await this.client
+      .from("conversations")
+      .update(patch)
+      .eq("id", conversationId);
+
+    if (error) throw repositoryError("Failed to update working memory", error);
+  }
+
+  async appendMessage(input: {
+    conversationId: string;
+    userId: string;
+    role: ConversationMessageRole;
+    content: string;
+    action?: string | null;
+  }): Promise<ConversationMessage> {
+    const { data, error } = await this.client
+      .from("conversation_messages")
+      .insert({
+        conversation_id: input.conversationId,
+        user_id: input.userId,
+        role: input.role,
+        content: input.content,
+        action: input.action ?? null,
+      })
+      .select("id, conversation_id, user_id, role, content, action, created_at")
+      .single();
+
+    if (error || !data) {
+      throw repositoryError("Failed to append conversation message", error);
+    }
+
+    return {
+      id: data.id,
+      conversationId: data.conversation_id,
+      userId: data.user_id,
+      role: data.role,
+      content: data.content,
+      action: data.action,
+      createdAt: new Date(data.created_at),
+    };
+  }
+
+  async listRecentMessages(
+    conversationId: string,
+    limit = 20,
+  ): Promise<ConversationMessage[]> {
+    const { data, error } = await this.client
+      .from("conversation_messages")
+      .select("id, conversation_id, user_id, role, content, action, created_at")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: false })
+      .limit(Math.max(1, Math.min(limit, 100)));
+
+    if (error) {
+      throw repositoryError("Failed to list recent messages", error);
+    }
+
+    return (data ?? [])
+      .map((row) => ({
+        id: row.id as string,
+        conversationId: row.conversation_id as string,
+        userId: row.user_id as string,
+        role: row.role as ConversationMessageRole,
+        content: row.content as string,
+        action: (row.action as string | null) ?? null,
+        createdAt: new Date(row.created_at as string),
+      }))
+      .reverse();
+  }
+
+  async insertMemoryChunk(input: MemoryChunkInput): Promise<string> {
+    const { data, error } = await this.client
+      .from("memory_chunks")
+      .insert({
+        user_id: input.userId,
+        conversation_id: input.conversationId,
+        content: input.content,
+        kind: input.kind ?? "turn",
+        source_message_ids: input.sourceMessageIds,
+        repo: input.repo ?? null,
+        branch: input.branch ?? null,
+        embedding: `[${input.embedding.join(",")}]`,
+      })
+      .select("id")
+      .single();
+
+    if (error || !data) {
+      throw repositoryError("Failed to insert memory chunk", error);
+    }
+    return data.id as string;
+  }
+
+  async searchMemoryChunks(
+    userId: string,
+    embedding: number[],
+    limit = 5,
+  ): Promise<MemoryChunkSearchResult[]> {
+    const { data, error } = await this.client.rpc("search_memory_chunks", {
+      p_user_id: userId,
+      p_embedding: `[${embedding.join(",")}]`,
+      p_limit: limit,
+    });
+
+    if (error) {
+      throw repositoryError("Failed to search memory chunks", error);
+    }
+
+    return (data ?? []).map((row: Record<string, unknown>) => ({
+      id: row.id as string,
+      conversationId: row.conversation_id as string,
+      content: row.content as string,
+      kind: row.kind as string,
+      sourceMessageIds: (row.source_message_ids as string[] | null) ?? [],
+      repo: (row.repo as string | null) ?? null,
+      branch: (row.branch as string | null) ?? null,
+      createdAt: new Date(row.created_at as string),
+      distance: Number(row.distance),
+    }));
   }
 
   async getNotificationTarget(

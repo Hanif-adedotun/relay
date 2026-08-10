@@ -27,6 +27,9 @@ export interface ConversationContext {
   githubLogin: string | null;
   activeRepo: string | null;
   activeBranch: string | null;
+  lastPrNumber: number | null;
+  lastPrUrl: string | null;
+  lastCommitSha: string | null;
   pendingGithubConfirmation: boolean;
   canListRepositories: boolean;
   canSelectRepository: boolean;
@@ -35,9 +38,16 @@ export interface ConversationContext {
   canWriteRepository: boolean;
 }
 
+export interface ConversationHistoryMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
 export interface ConversationTurnInput {
   userText: string;
   context: ConversationContext;
+  recentMessages?: ConversationHistoryMessage[];
+  retrievedMemory?: string[];
   toolResults?: Array<{
     action: ConversationAction;
     result: unknown;
@@ -65,8 +75,10 @@ const FALLBACK_REPLY =
 
 const SYSTEM_PROMPT = `You are Relay, a conversation-first software engineering assistant over iMessage.
 Keep replies short (1-3 sentences). Be direct and helpful.
-You receive factual context JSON and optional tool results. Never invent repositories, branches, tokens, URLs, or file contents.
+You receive factual context JSON, recentMessages, optional retrievedMemory, and optional tool results. Never invent repositories, branches, tokens, URLs, or file contents.
 Never include http(s) links in reply text.
+Use recentMessages for short-term continuity in this chat.
+Use retrievedMemory as optional older facts about this client; prefer working-memory fields (activeRepo, activeBranch, lastPrNumber, lastPrUrl, lastCommitSha) for current session truth.
 Actions:
 - none: just reply
 - list_repositories: list repos available to the connected GitHub App installation
@@ -263,6 +275,8 @@ export class OpenRouterConversationModel implements ConversationModel {
                 content: JSON.stringify({
                   userText: input.userText,
                   context: input.context,
+                  recentMessages: input.recentMessages ?? [],
+                  retrievedMemory: input.retrievedMemory ?? [],
                   toolResults: input.toolResults ?? [],
                 }),
               },

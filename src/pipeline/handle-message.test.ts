@@ -7,6 +7,7 @@ import type {
   GitHubReposClient,
   GitHubRepositoryInspection,
 } from "../github/repos.ts";
+import type { EmbeddingClient } from "../memory/embeddings.ts";
 import {
   emptyTurnFields,
   type ConversationModel,
@@ -23,6 +24,10 @@ const githubConfig = {
   privateKey: "key",
   slug: "relay-test",
   callbackUrl: "https://relay.test/auth/github/callback",
+};
+
+const stubEmbeddings: EmbeddingClient = {
+  embedTexts: async (texts) => texts.map(() => [0.1, 0.2, 0.3]),
 };
 
 function turn(
@@ -49,6 +54,21 @@ class ScriptedConversationModel implements ConversationModel {
     }
     return next(input);
   }
+}
+
+function makePipeline(
+  repository: FakeRelayRepository,
+  model: ConversationModel,
+  repos: GitHubReposClient,
+  embeddings: EmbeddingClient = stubEmbeddings,
+): RelayMessagePipeline {
+  return new RelayMessagePipeline(
+    repository,
+    model,
+    new GitHubAuthStateService(repository, githubConfig),
+    repos,
+    embeddings,
+  );
 }
 
 const emptyRepos: GitHubReposClient = {
@@ -116,7 +136,7 @@ describe("RelayMessagePipeline soft context", () => {
   test("answers without GitHub and does not force a connect link", async () => {
     const repository = new FakeRelayRepository();
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -125,7 +145,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "none",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       emptyRepos,
     );
 
@@ -148,7 +167,7 @@ describe("RelayMessagePipeline soft context", () => {
   test("appends a trusted OAuth URL when offering GitHub connect", async () => {
     const repository = new FakeRelayRepository();
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -157,7 +176,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "offer_github_connect",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       emptyRepos,
     );
 
@@ -171,9 +189,10 @@ describe("RelayMessagePipeline soft context", () => {
       },
     });
 
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("Connect GitHub so I can see your repositories.");
-    expect(sent[0]).toContain(
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toBe("Preparing a GitHub connect link…");
+    expect(sent[1]).toContain("Connect GitHub so I can see your repositories.");
+    expect(sent[1]).toContain(
       "https://github.com/login/oauth/authorize?client_id=client",
     );
     expect(repository.authSessions.size).toBe(1);
@@ -196,7 +215,7 @@ describe("RelayMessagePipeline soft context", () => {
 
     const sent: string[] = [];
     const seenToolResults: unknown[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -212,7 +231,6 @@ describe("RelayMessagePipeline soft context", () => {
           });
         },
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         listRepositories: async () => [
@@ -264,7 +282,7 @@ describe("RelayMessagePipeline soft context", () => {
     await repository.setActiveBranch(identity.conversationId, "develop");
 
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -279,7 +297,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "none",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         findRepository: async () => ({
@@ -329,7 +346,7 @@ describe("RelayMessagePipeline soft context", () => {
 
     const sent: string[] = [];
     const seenToolResults: unknown[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -345,7 +362,6 @@ describe("RelayMessagePipeline soft context", () => {
           });
         },
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         listBranches: async () => sampleBranches,
@@ -388,7 +404,7 @@ describe("RelayMessagePipeline soft context", () => {
     );
 
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -403,7 +419,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "none",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         listBranches: async () => sampleBranches,
@@ -448,7 +463,7 @@ describe("RelayMessagePipeline soft context", () => {
     );
 
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -463,7 +478,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "none",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         createBranch: async (_installationId, _fullName, branch) => ({
@@ -489,7 +503,11 @@ describe("RelayMessagePipeline soft context", () => {
       conversationId: identity.conversationId,
     });
     expect(state.activeBranch).toBe("feat/onboarding");
-    expect(sent).toEqual(["Branch feat/onboarding is ready."]);
+    expect(sent).toEqual([
+      "Creating branch feat/onboarding…",
+      "Created feat/onboarding.",
+      "Branch feat/onboarding is ready.",
+    ]);
   });
 
   test("commits files in replace mode on the active branch", async () => {
@@ -513,7 +531,7 @@ describe("RelayMessagePipeline soft context", () => {
 
     const commitInputs: GitHubCommitFilesInput[] = [];
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -536,7 +554,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "none",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         commitFiles: async (_installationId, _fullName, input) => {
@@ -575,7 +592,91 @@ describe("RelayMessagePipeline soft context", () => {
       conversationId: identity.conversationId,
     });
     expect(state.activeBranch).toBe("feat/onboarding");
-    expect(sent).toEqual(["Committed architecture.md only."]);
+    expect(sent).toEqual([
+      "Committing changes…",
+      "Committed architecture.md.",
+      "Committed architecture.md only.",
+    ]);
+  });
+
+  test("sends progress for create branch then commit then final reply", async () => {
+    const repository = new FakeRelayRepository();
+    const identity = await repository.resolveIdentity({
+      platform: "iMessage",
+      externalUserId: "+15550001111",
+      externalSpaceId: "chat-1",
+    });
+    repository.connections.push({
+      userId: identity.userId,
+      installationId: 10,
+      githubUserId: 20,
+      githubLogin: "octocat",
+      repositorySelection: "selected",
+    });
+    await repository.setActiveRepo(
+      identity.conversationId,
+      "octocat/portfolio",
+    );
+
+    const sent: string[] = [];
+    const pipeline = makePipeline(
+      repository,
+      new ScriptedConversationModel([
+        () =>
+          turn({
+            reply: "Working on it.",
+            action: "create_branch",
+            branch: "feat/onboarding",
+          }),
+        () =>
+          turn({
+            reply: "Working on it.",
+            action: "commit_files",
+            branch: "feat/onboarding",
+            commitMessage: "chore: architecture only",
+            commitMode: "replace",
+            files: [{ path: "architecture.md", content: "# Architecture\n" }],
+          }),
+        () =>
+          turn({
+            reply: "All set on feat/onboarding.",
+            action: "none",
+          }),
+      ]),
+      {
+        ...emptyRepos,
+        createBranch: async (_installationId, _fullName, branch) => ({
+          branch,
+          sha: "abc123",
+          fromRef: "main",
+        }),
+        commitFiles: async (_installationId, _fullName, input) => ({
+          branch: input.branch,
+          sha: "def456",
+          message: input.message,
+          mode: input.mode,
+          changedPaths: input.files.map((file) => file.path),
+        }),
+      },
+    );
+
+    await pipeline.handle({
+      platform: "iMessage",
+      senderId: "+15550001111",
+      spaceId: "chat-1",
+      text: "create feat/onboarding with only architecture.md",
+      send: async (text) => {
+        sent.push(text);
+      },
+    });
+
+    expect(sent).toEqual([
+      "Creating branch feat/onboarding…",
+      "Created feat/onboarding.",
+      "Committing changes…",
+      "Committed architecture.md.",
+      "All set on feat/onboarding.",
+    ]);
   });
 
   test("appends the pull request URL after create_pull_request", async () => {
@@ -602,7 +703,7 @@ describe("RelayMessagePipeline soft context", () => {
     );
 
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -619,7 +720,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "none",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         createPullRequest: async () => ({
@@ -642,11 +742,69 @@ describe("RelayMessagePipeline soft context", () => {
       },
     });
 
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain("PR is ready.");
-    expect(sent[0]).toContain(
-      "https://github.com/octocat/portfolio/pull/12",
+    expect(sent).toEqual([
+      "Opening pull request…",
+      "PR is ready.\n\nPull request:\nhttps://github.com/octocat/portfolio/pull/12",
+    ]);
+  });
+
+  test("sends a failure progress line when create_branch fails", async () => {
+    const repository = new FakeRelayRepository();
+    const identity = await repository.resolveIdentity({
+      platform: "iMessage",
+      externalUserId: "+15550001111",
+      externalSpaceId: "chat-1",
+    });
+    repository.connections.push({
+      userId: identity.userId,
+      installationId: 10,
+      githubUserId: 20,
+      githubLogin: "octocat",
+      repositorySelection: "selected",
+    });
+    await repository.setActiveRepo(
+      identity.conversationId,
+      "octocat/portfolio",
     );
+
+    const sent: string[] = [];
+    const pipeline = makePipeline(
+      repository,
+      new ScriptedConversationModel([
+        () =>
+          turn({
+            reply: "Creating branch.",
+            action: "create_branch",
+            branch: "feat/onboarding",
+          }),
+        () =>
+          turn({
+            reply: "That branch already exists. Pick another name?",
+            action: "none",
+          }),
+      ]),
+      {
+        ...emptyRepos,
+        createBranch: async () => {
+          throw new Error("Reference already exists status=422");
+        },
+      },
+    );
+
+    await pipeline.handle({
+      platform: "iMessage",
+      senderId: "+15550001111",
+      spaceId: "chat-1",
+      text: "create feat/onboarding",
+      send: async (text) => {
+        sent.push(text);
+      },
+    });
+
+    expect(sent[0]).toBe("Creating branch feat/onboarding…");
+    expect(sent[1]).toContain("Couldn’t create the branch:");
+    expect(sent[1]).toContain("Reference already exists");
+    expect(sent[2]).toBe("That branch already exists. Pick another name?");
   });
 
   test("inspects the active repository then summarizes from tool facts", async () => {
@@ -670,7 +828,7 @@ describe("RelayMessagePipeline soft context", () => {
 
     const sent: string[] = [];
     const seenToolResults: unknown[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -687,7 +845,6 @@ describe("RelayMessagePipeline soft context", () => {
           });
         },
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       {
         ...emptyRepos,
         inspectRepository: async () => sampleInspection,
@@ -729,7 +886,7 @@ describe("RelayMessagePipeline soft context", () => {
 
     const sent: string[] = [];
     const seenErrors: unknown[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -746,7 +903,6 @@ describe("RelayMessagePipeline soft context", () => {
           });
         },
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       emptyRepos,
     );
 
@@ -783,7 +939,7 @@ describe("RelayMessagePipeline soft context", () => {
 
     const sent: string[] = [];
     const seenErrors: unknown[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -799,7 +955,6 @@ describe("RelayMessagePipeline soft context", () => {
           });
         },
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       emptyRepos,
     );
 
@@ -822,7 +977,7 @@ describe("RelayMessagePipeline soft context", () => {
   test("returns a tool error when repo tools are used without GitHub", async () => {
     const repository = new FakeRelayRepository();
     const sent: string[] = [];
-    const pipeline = new RelayMessagePipeline(
+    const pipeline = makePipeline(
       repository,
       new ScriptedConversationModel([
         () =>
@@ -842,7 +997,6 @@ describe("RelayMessagePipeline soft context", () => {
             action: "offer_github_connect",
           }),
       ]),
-      new GitHubAuthStateService(repository, githubConfig),
       emptyRepos,
     );
 
@@ -856,7 +1010,113 @@ describe("RelayMessagePipeline soft context", () => {
       },
     });
 
-    expect(sent[0]).toContain("GitHub is not connected yet.");
-    expect(sent[0]).toContain("Connect GitHub:");
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toBe("Preparing a GitHub connect link…");
+    expect(sent[1]).toContain("GitHub is not connected yet.");
+    expect(sent[1]).toContain("Connect GitHub:");
+  });
+
+  test("passes prior messages into the next turn as recentMessages", async () => {
+    const repository = new FakeRelayRepository();
+    const seenRecent: unknown[] = [];
+
+    await makePipeline(
+      repository,
+      new ScriptedConversationModel([
+        () => turn({ reply: "Hello there.", action: "none" }),
+      ]),
+      emptyRepos,
+    ).handle({
+      platform: "iMessage",
+      senderId: "+15550001111",
+      spaceId: "chat-1",
+      text: "hi",
+      send: async () => undefined,
+    });
+
+    await makePipeline(
+      repository,
+      new ScriptedConversationModel([
+        (input) => {
+          seenRecent.push(input.recentMessages);
+          return turn({ reply: "Welcome back.", action: "none" });
+        },
+      ]),
+      emptyRepos,
+    ).handle({
+      platform: "iMessage",
+      senderId: "+15550001111",
+      spaceId: "chat-1",
+      text: "still there?",
+      send: async () => undefined,
+    });
+
+    expect(seenRecent[0]).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "Hello there." },
+    ]);
+  });
+
+  test("stores last PR fields in working memory after create_pull_request", async () => {
+    const repository = new FakeRelayRepository();
+    const identity = await repository.resolveIdentity({
+      platform: "iMessage",
+      externalUserId: "+15550001111",
+      externalSpaceId: "chat-1",
+    });
+    repository.connections.push({
+      userId: identity.userId,
+      installationId: 10,
+      githubUserId: 20,
+      githubLogin: "octocat",
+      repositorySelection: "selected",
+    });
+    await repository.setActiveRepo(
+      identity.conversationId,
+      "octocat/portfolio",
+    );
+    await repository.setActiveBranch(
+      identity.conversationId,
+      "feat/onboarding",
+    );
+
+    await makePipeline(
+      repository,
+      new ScriptedConversationModel([
+        () =>
+          turn({
+            reply: "Opening a PR.",
+            action: "create_pull_request",
+            branch: "feat/onboarding",
+            prTitle: "feat: onboarding",
+          }),
+        () => turn({ reply: "PR is ready.", action: "none" }),
+      ]),
+      {
+        ...emptyRepos,
+        createPullRequest: async () => ({
+          number: 12,
+          url: "https://github.com/octocat/portfolio/pull/12",
+          title: "feat: onboarding",
+          head: "feat/onboarding",
+          base: "main",
+        }),
+      },
+    ).handle({
+      platform: "iMessage",
+      senderId: "+15550001111",
+      spaceId: "chat-1",
+      text: "open a PR",
+      send: async () => undefined,
+    });
+
+    const state = await repository.getConversationState({
+      userId: identity.userId,
+      conversationId: identity.conversationId,
+    });
+    expect(state.lastPrNumber).toBe(12);
+    expect(state.lastPrUrl).toBe(
+      "https://github.com/octocat/portfolio/pull/12",
+    );
   });
 });

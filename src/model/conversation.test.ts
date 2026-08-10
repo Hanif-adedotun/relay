@@ -10,6 +10,7 @@ import {
 const config = {
   apiKey: "test-key",
   model: "test/model",
+  embeddingModel: "test/embedding",
 };
 
 const baseInput = {
@@ -20,6 +21,9 @@ const baseInput = {
     githubLogin: null,
     activeRepo: null,
     activeBranch: null,
+    lastPrNumber: null,
+    lastPrUrl: null,
+    lastCommitSha: null,
     pendingGithubConfirmation: false,
     canListRepositories: false,
     canSelectRepository: false,
