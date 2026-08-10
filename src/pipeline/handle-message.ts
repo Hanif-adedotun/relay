@@ -6,6 +6,8 @@ import {
   buildTurnMemoryChunk,
   retrieveMemory,
 } from "../memory/retrieve.ts";
+import type { AckModel } from "../model/ack.ts";
+import { shouldSkipAck, withAckTimeout } from "../model/ack.ts";
 import type {
   ConversationAction,
   ConversationHistoryMessage,
@@ -113,6 +115,7 @@ export class RelayMessagePipeline {
     private readonly githubAuth: GitHubAuthStateService,
     private readonly githubRepos: GitHubReposClient,
     private readonly embeddings: EmbeddingClient,
+    private readonly ack: AckModel,
   ) {}
 
   async handle(message: InboundTextMessage): Promise<MessageGateResult> {
@@ -135,6 +138,16 @@ export class RelayMessagePipeline {
         pendingGithubConfirmation: true,
       };
     }
+
+    const ackPromise = shouldSkipAck(message.text)
+      ? null
+      : withAckTimeout(
+          this.ack.acknowledge({
+            userText: message.text,
+            activeRepo: state.activeRepo,
+            githubConnected: state.github !== null,
+          }),
+        );
 
     const recentMessages = await this.repository.listRecentMessages(
       identity.conversationId,
@@ -176,6 +189,10 @@ export class RelayMessagePipeline {
       await message.send(trimmed);
       progress.last = trimmed;
     };
+
+    if (ackPromise) {
+      await sendProgress(await ackPromise);
+    }
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
       const githubConnected = state.github !== null;

@@ -11,6 +11,7 @@ export interface RelayConfig {
     apiKey: string;
     model: string;
     embeddingModel: string;
+    ackModel: string;
   };
   github: {
     appId: string;
@@ -69,6 +70,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
       embeddingModel:
         env.OPENROUTER_EMBEDDING_MODEL?.trim() ||
         "openai/text-embedding-3-small",
+      ackModel: env.OPENROUTER_ACK_MODEL?.trim() || "openai/gpt-4o-mini",
     },
     github: {
       appId: required(env, "GITHUB_APP_ID"),

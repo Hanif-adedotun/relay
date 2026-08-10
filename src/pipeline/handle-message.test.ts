@@ -8,6 +8,7 @@ import type {
   GitHubRepositoryInspection,
 } from "../github/repos.ts";
 import type { EmbeddingClient } from "../memory/embeddings.ts";
+import type { AckModel } from "../model/ack.ts";
 import {
   emptyTurnFields,
   type ConversationModel,
@@ -28,6 +29,10 @@ const githubConfig = {
 
 const stubEmbeddings: EmbeddingClient = {
   embedTexts: async (texts) => texts.map(() => [0.1, 0.2, 0.3]),
+};
+
+const stubAck: AckModel = {
+  acknowledge: async () => "On it…",
 };
 
 function turn(
@@ -61,6 +66,7 @@ function makePipeline(
   model: ConversationModel,
   repos: GitHubReposClient,
   embeddings: EmbeddingClient = stubEmbeddings,
+  ack: AckModel = stubAck,
 ): RelayMessagePipeline {
   return new RelayMessagePipeline(
     repository,
@@ -68,6 +74,7 @@ function makePipeline(
     new GitHubAuthStateService(repository, githubConfig),
     repos,
     embeddings,
+    ack,
   );
 }
 
@@ -159,6 +166,7 @@ describe("RelayMessagePipeline soft context", () => {
     });
 
     expect(sent).toEqual([
+      "On it…",
       "Relay helps with repos over chat. What do you need?",
     ]);
     expect(repository.authSessions.size).toBe(0);
@@ -189,10 +197,11 @@ describe("RelayMessagePipeline soft context", () => {
       },
     });
 
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toBe("Preparing a GitHub connect link…");
-    expect(sent[1]).toContain("Connect GitHub so I can see your repositories.");
-    expect(sent[1]).toContain(
+    expect(sent).toHaveLength(3);
+    expect(sent[0]).toBe("On it…");
+    expect(sent[1]).toBe("Preparing a GitHub connect link…");
+    expect(sent[2]).toContain("Connect GitHub so I can see your repositories.");
+    expect(sent[2]).toContain(
       "https://github.com/login/oauth/authorize?client_id=client",
     );
     expect(repository.authSessions.size).toBe(1);
@@ -261,7 +270,7 @@ describe("RelayMessagePipeline soft context", () => {
         },
       },
     ]);
-    expect(sent).toEqual(["I can see portfolio and relay. Which one?"]);
+    expect(sent).toEqual(["On it…", "I can see portfolio and relay. Which one?"]);
   });
 
   test("selects and stores an active repository", async () => {
@@ -322,7 +331,7 @@ describe("RelayMessagePipeline soft context", () => {
     });
     expect(state.activeRepo).toBe("octocat/portfolio");
     expect(state.activeBranch).toBeNull();
-    expect(sent).toEqual(["portfolio is now your active repo."]);
+    expect(sent).toEqual(["On it…", "portfolio is now your active repo."]);
   });
 
   test("lists branches when a repository is active", async () => {
@@ -381,7 +390,7 @@ describe("RelayMessagePipeline soft context", () => {
     expect(seenToolResults[0]).toEqual([
       { action: "list_branches", result: sampleBranches },
     ]);
-    expect(sent).toEqual(["main and feature/login. Which branch?"]);
+    expect(sent).toEqual(["On it…", "main and feature/login. Which branch?"]);
   });
 
   test("selects an active branch after verifying it exists", async () => {
@@ -440,7 +449,7 @@ describe("RelayMessagePipeline soft context", () => {
       conversationId: identity.conversationId,
     });
     expect(state.activeBranch).toBe("feature/login");
-    expect(sent).toEqual(["Using feature/login."]);
+    expect(sent).toEqual(["On it…", "Using feature/login."]);
   });
 
   test("creates a branch and stores it as active", async () => {
@@ -504,6 +513,7 @@ describe("RelayMessagePipeline soft context", () => {
     });
     expect(state.activeBranch).toBe("feat/onboarding");
     expect(sent).toEqual([
+      "On it…",
       "Creating branch feat/onboarding…",
       "Created feat/onboarding.",
       "Branch feat/onboarding is ready.",
@@ -593,6 +603,7 @@ describe("RelayMessagePipeline soft context", () => {
     });
     expect(state.activeBranch).toBe("feat/onboarding");
     expect(sent).toEqual([
+      "On it…",
       "Committing changes…",
       "Committed architecture.md.",
       "Committed architecture.md only.",
@@ -671,6 +682,7 @@ describe("RelayMessagePipeline soft context", () => {
     });
 
     expect(sent).toEqual([
+      "On it…",
       "Creating branch feat/onboarding…",
       "Created feat/onboarding.",
       "Committing changes…",
@@ -743,6 +755,7 @@ describe("RelayMessagePipeline soft context", () => {
     });
 
     expect(sent).toEqual([
+      "On it…",
       "Opening pull request…",
       "PR is ready.\n\nPull request:\nhttps://github.com/octocat/portfolio/pull/12",
     ]);
@@ -801,10 +814,11 @@ describe("RelayMessagePipeline soft context", () => {
       },
     });
 
-    expect(sent[0]).toBe("Creating branch feat/onboarding…");
-    expect(sent[1]).toContain("Couldn’t create the branch:");
-    expect(sent[1]).toContain("Reference already exists");
-    expect(sent[2]).toBe("That branch already exists. Pick another name?");
+    expect(sent[0]).toBe("On it…");
+    expect(sent[1]).toBe("Creating branch feat/onboarding…");
+    expect(sent[2]).toContain("Couldn’t create the branch:");
+    expect(sent[2]).toContain("Reference already exists");
+    expect(sent[3]).toBe("That branch already exists. Pick another name?");
   });
 
   test("inspects the active repository then summarizes from tool facts", async () => {
@@ -865,6 +879,7 @@ describe("RelayMessagePipeline soft context", () => {
       { action: "inspect_repository", result: sampleInspection },
     ]);
     expect(sent).toEqual([
+      "On it…",
       "portfolio is a TypeScript personal site. README describes a personal website.",
     ]);
   });
@@ -919,7 +934,7 @@ describe("RelayMessagePipeline soft context", () => {
     expect(seenErrors[0]).toEqual({
       error: "No active repository is selected for this conversation.",
     });
-    expect(sent).toEqual(["Pick a repository first."]);
+    expect(sent).toEqual(["On it…", "Pick a repository first."]);
   });
 
   test("returns a tool error when branch tools run without an active repo", async () => {
@@ -971,7 +986,7 @@ describe("RelayMessagePipeline soft context", () => {
     expect(seenErrors[0]).toEqual({
       error: "No active repository is selected for this conversation.",
     });
-    expect(sent).toEqual(["Pick a repository first."]);
+    expect(sent).toEqual(["On it…", "Pick a repository first."]);
   });
 
   test("returns a tool error when repo tools are used without GitHub", async () => {
@@ -1010,10 +1025,11 @@ describe("RelayMessagePipeline soft context", () => {
       },
     });
 
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toBe("Preparing a GitHub connect link…");
-    expect(sent[1]).toContain("GitHub is not connected yet.");
-    expect(sent[1]).toContain("Connect GitHub:");
+    expect(sent).toHaveLength(3);
+    expect(sent[0]).toBe("On it…");
+    expect(sent[1]).toBe("Preparing a GitHub connect link…");
+    expect(sent[2]).toContain("GitHub is not connected yet.");
+    expect(sent[2]).toContain("Connect GitHub:");
   });
 
   test("passes prior messages into the next turn as recentMessages", async () => {
@@ -1118,5 +1134,81 @@ describe("RelayMessagePipeline soft context", () => {
     expect(state.lastPrUrl).toBe(
       "https://github.com/octocat/portfolio/pull/12",
     );
+  });
+
+  test("sends ack first and does not persist it in history", async () => {
+    const repository = new FakeRelayRepository();
+    const sent: string[] = [];
+    const ack: AckModel = {
+      acknowledge: async () => "Looking into that…",
+    };
+    const pipeline = makePipeline(
+      repository,
+      new ScriptedConversationModel([
+        () =>
+          turn({
+            reply: "Here are your options.",
+            action: "none",
+          }),
+      ]),
+      emptyRepos,
+      stubEmbeddings,
+      ack,
+    );
+
+    await pipeline.handle({
+      platform: "iMessage",
+      senderId: "+15550001111",
+      spaceId: "chat-1",
+      text: "list my repos",
+      send: async (text) => {
+        sent.push(text);
+      },
+    });
+
+    expect(sent).toEqual(["Looking into that…", "Here are your options."]);
+
+    const identity = await repository.resolveIdentity({
+      platform: "iMessage",
+      externalUserId: "+15550001111",
+      externalSpaceId: "chat-1",
+    });
+    const recent = await repository.listRecentMessages(
+      identity.conversationId,
+      20,
+    );
+    expect(recent.map((row) => row.content)).toEqual([
+      "list my repos",
+      "Here are your options.",
+    ]);
+  });
+
+  test("skips ack for short affirmations", async () => {
+    const repository = new FakeRelayRepository();
+    const sent: string[] = [];
+    const ack: AckModel = {
+      acknowledge: async () => "Looking into that…",
+    };
+    const pipeline = makePipeline(
+      repository,
+      new ScriptedConversationModel([
+        () => turn({ reply: "Done.", action: "none" }),
+      ]),
+      emptyRepos,
+      stubEmbeddings,
+      ack,
+    );
+
+    await pipeline.handle({
+      platform: "iMessage",
+      senderId: "+15550001111",
+      spaceId: "chat-1",
+      text: "yes",
+      send: async (text) => {
+        sent.push(text);
+      },
+    });
+
+    expect(sent).toEqual(["Done."]);
   });
 });

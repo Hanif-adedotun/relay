@@ -11,6 +11,7 @@ const config = {
   apiKey: "test-key",
   model: "test/model",
   embeddingModel: "test/embedding",
+  ackModel: "test/ack",
 };
 
 const baseInput = {

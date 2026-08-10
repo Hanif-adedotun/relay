@@ -8,6 +8,7 @@ import { GitHubAuthStateService } from "./github/auth-state.ts";
 import { createGitHubCallbackHandler } from "./github/callback.ts";
 import { createInstallationReposClient } from "./github/repos.ts";
 import { createOpenRouterEmbeddingClient } from "./memory/embeddings.ts";
+import { OpenRouterAckModel } from "./model/ack.ts";
 import { OpenRouterConversationModel } from "./model/conversation.ts";
 import { RelayMessagePipeline } from "./pipeline/handle-message.ts";
 
@@ -19,12 +20,14 @@ const conversation = new OpenRouterConversationModel(config.openRouter);
 const githubAuth = new GitHubAuthStateService(repository, config.github);
 const githubRepos = createInstallationReposClient(config.github);
 const embeddings = createOpenRouterEmbeddingClient(config.openRouter);
+const ack = new OpenRouterAckModel(config.openRouter);
 const pipeline = new RelayMessagePipeline(
   repository,
   conversation,
   githubAuth,
   githubRepos,
   embeddings,
+  ack,
 );
 
 const app = await Spectrum({
